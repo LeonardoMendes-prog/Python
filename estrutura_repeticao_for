@@ -1,0 +1,26 @@
+texto = input("Informe um texto: ")
+VOGAIS = "AEIOU"
+
+if texto:  # garante que não está vazio
+    print(f"As vogais em '{texto}' são: ", end="")
+
+    for x in texto:
+        if x.upper() in VOGAIS:
+            print(x, end="")
+
+    print()  # quebra de linha no final
+else:
+    print("Digite um texto válido!")
+print("Fim do programa.")
+print("")
+
+# exemplo de estrutura de repetição FOR com range decrescente
+#for numero in range (10, 0, -1):
+#    print(numero, end=" ")
+
+# exemplo de estrutura de repetição FOR com range
+# start = 0 (padrão)
+# stop = 51 (não inclusivo)
+# step = 5 (opcional, padrão = 1)
+for numero in range (0, 51, 5):
+    print(numero, end=" ")
