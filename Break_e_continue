@@ -1,0 +1,23 @@
+#for numero in range (100):
+
+#    if numero == 12:
+ #       break
+
+#print("O número 12 foi encontrado, encerrando o loop.")
+    
+
+
+ # a diferença do continue para o break é que o continue ele exclui o que está dentro do IF e continua a execução do loop.   
+#for numero in range(100):
+
+ #   if numero == 12:
+  #      continue
+
+   # print(numero, end=" ")
+    
+for numero in range(100):
+
+    if numero  % 2 == 0:
+        continue
+
+    print(numero, end=" ")
