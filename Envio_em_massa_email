@@ -1,0 +1,272 @@
+"""
+Email em massa - Backend Flask
+=========================================
+
+Aplicação web para envio seguro de emails em massa.
+
+Recursos de segurança / boas práticas incluídos:
+- Credenciais SMTP nunca ficam hardcoded: vêm do .env (não versionar!)
+- Conexão SMTP sempre via TLS/SSL
+- Envio individual por destinatário (nunca em CC/BCC coletivo), evitando
+  vazamento de lista de emails entre destinatários
+- Limite de taxa (rate limiting) configurável entre envios, para reduzir
+  risco de bloqueio por spam e respeitar limites do provedor SMTP
+- Validação básica de formato de email antes do envio
+- Suporte a anexo (um arquivo por campanha)
+- Progresso da campanha consultável via endpoint /status/<job_id>
+- Log de sucesso/erro por destinatário, sem expor senha/credenciais no log
+
+OBS: Caso tenha um codigo fonte com logica diferente da atual, Substitua a função `enviar_email_individual()` pela lógica do
+seu código-fonte
+=========================================
+
+
+import os
+import re
+import csv
+import io
+import time
+import uuid
+import smtplib
+import threading
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB por requisição
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Estado das campanhas em memória (para produção, usar Redis/DB)
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+# ----------------------------------------------------------------------
+# Utilidades
+# ----------------------------------------------------------------------
+
+def extrair_emails_do_texto(texto: str) -> list[str]:
+    """Extrai emails de um texto colado (separados por vírgula, ; ou linha)."""
+    partes = re.split(r"[,\n;]+", texto)
+    emails = [p.strip() for p in partes if p.strip()]
+    return emails
+
+
+def extrair_emails_do_arquivo(caminho: str) -> list[str]:
+    """Lê emails de um CSV ou Excel (procura coluna 'email' ou usa a 1ª coluna)."""
+    emails = []
+    if caminho.lower().endswith(".csv"):
+        with open(caminho, newline="", encoding="utf-8-sig") as f:
+            leitor = csv.reader(f)
+            linhas = list(leitor)
+    else:
+        # Excel: usa openpyxl via pandas
+        import pandas as pd
+        df = pd.read_excel(caminho, dtype=str)
+        linhas = [df.columns.tolist()] + df.fillna("").values.tolist()
+
+    if not linhas:
+        return emails
+
+    cabecalho = [c.strip().lower() for c in linhas[0]]
+    col_email = 0
+    if "email" in cabecalho:
+        col_email = cabecalho.index("email")
+        linhas = linhas[1:]
+    elif EMAIL_REGEX.match(str(linhas[0][0]).strip()):
+        pass  # não tem cabeçalho, primeira linha já é dado
+    else:
+        linhas = linhas[1:]  # assume que a 1ª linha é cabeçalho desconhecido
+
+    for linha in linhas:
+        if len(linha) > col_email:
+            valor = str(linha[col_email]).strip()
+            if valor:
+                emails.append(valor)
+    return emails
+
+
+def validar_e_deduplicar(emails: list[str]) -> tuple[list[str], list[str]]:
+    """Retorna (válidos_únicos, inválidos)."""
+    vistos = set()
+    validos, invalidos = [], []
+    for e in emails:
+        e_norm = e.strip().lower()
+        if not EMAIL_REGEX.match(e_norm):
+            invalidos.append(e)
+            continue
+        if e_norm in vistos:
+            continue
+        vistos.add(e_norm)
+        validos.append(e_norm)
+    return validos, invalidos
+
+
+def montar_mensagem(remetente: str, destinatario: str, assunto: str,
+                     corpo_html: str, caminho_anexo: str | None) -> MIMEMultipart:
+    msg = MIMEMultipart()
+    msg["From"] = remetente
+    msg["To"] = destinatario
+    msg["Subject"] = assunto
+    msg.attach(MIMEText(corpo_html, "html", "utf-8"))
+
+    if caminho_anexo and os.path.isfile(caminho_anexo):
+        with open(caminho_anexo, "rb") as f:
+            parte = MIMEBase("application", "octet-stream")
+            parte.set_payload(f.read())
+        encoders.encode_base64(parte)
+        nome_arquivo = os.path.basename(caminho_anexo)
+        parte.add_header("Content-Disposition", f"attachment; filename={nome_arquivo}")
+        msg.attach(parte)
+
+    return msg
+
+
+def enviar_email_individual(smtp, remetente: str, destinatario: str,
+                             assunto: str, corpo_html: str,
+                             caminho_anexo: str | None) -> None:
+    """Envia um único email. Troque por seu código exemplar, se preferir."""
+    msg = montar_mensagem(remetente, destinatario, assunto, corpo_html, caminho_anexo)
+    smtp.sendmail(remetente, [destinatario], msg.as_string())
+
+
+def rodar_campanha(job_id: str, destinatarios: list[str], assunto: str,
+                    corpo_html: str, caminho_anexo: str | None,
+                    intervalo_segundos: float):
+    smtp_host = os.environ["SMTP_HOST"]
+    smtp_port = int(os.environ.get("SMTP_PORT", 587))
+    smtp_user = os.environ["SMTP_USER"]
+    smtp_pass = os.environ["SMTP_PASSWORD"]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "enviando"
+
+    enviados, falhas = [], []
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
+            smtp.starttls()
+            smtp.login(smtp_user, smtp_pass)
+
+            for destinatario in destinatarios:
+                try:
+                    enviar_email_individual(
+                        smtp, smtp_user, destinatario, assunto, corpo_html, caminho_anexo
+                    )
+                    enviados.append(destinatario)
+                except Exception as e:
+                    falhas.append({"email": destinatario, "erro": str(e)})
+
+                with JOBS_LOCK:
+                    JOBS[job_id]["enviados"] = len(enviados)
+                    JOBS[job_id]["falhas"] = falhas
+                    JOBS[job_id]["total_processado"] = len(enviados) + len(falhas)
+
+                time.sleep(intervalo_segundos)  # respeita limite de taxa
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "concluido"
+
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "erro"
+            JOBS[job_id]["erro_geral"] = str(e)
+
+
+# ----------------------------------------------------------------------
+# Rotas
+# ----------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/preparar-destinatarios", methods=["POST"])
+def preparar_destinatarios():
+    """Recebe texto colado e/ou arquivo, retorna prévia validada (sem enviar nada)."""
+    emails = []
+
+    texto = request.form.get("emails_texto", "")
+    if texto.strip():
+        emails += extrair_emails_do_texto(texto)
+
+    arquivo = request.files.get("arquivo_emails")
+    if arquivo and arquivo.filename:
+        nome_seguro = secure_filename(arquivo.filename)
+        caminho = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{nome_seguro}")
+        arquivo.save(caminho)
+        try:
+            emails += extrair_emails_do_arquivo(caminho)
+        finally:
+            os.remove(caminho)
+
+    validos, invalidos = validar_e_deduplicar(emails)
+    return jsonify({
+        "total_valido": len(validos),
+        "total_invalido": len(invalidos),
+        "invalidos_amostra": invalidos[:10],
+        "validos": validos,
+    })
+
+
+@app.route("/api/enviar-campanha", methods=["POST"])
+def enviar_campanha():
+    destinatarios = request.form.getlist("destinatarios[]")
+    assunto = request.form.get("assunto", "").strip()
+    corpo_html = request.form.get("corpo_html", "").strip()
+    intervalo = float(request.form.get("intervalo_segundos", 1.0))
+
+    if not destinatarios:
+        return jsonify({"erro": "Nenhum destinatário válido informado."}), 400
+    if not assunto or not corpo_html:
+        return jsonify({"erro": "Assunto e corpo da mensagem são obrigatórios."}), 400
+
+    caminho_anexo = None
+    anexo = request.files.get("anexo")
+    if anexo and anexo.filename:
+        nome_seguro = secure_filename(anexo.filename)
+        caminho_anexo = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{nome_seguro}")
+        anexo.save(caminho_anexo)
+
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "iniciando",
+            "total": len(destinatarios),
+            "enviados": 0,
+            "falhas": [],
+            "total_processado": 0,
+        }
+
+    thread = threading.Thread(
+        target=rodar_campanha,
+        args=(job_id, destinatarios, assunto, corpo_html, caminho_anexo, intervalo),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/status/<job_id>")
+def status_campanha(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"erro": "job não encontrado"}), 404
+    return jsonify(job)
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
